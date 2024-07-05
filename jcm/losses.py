@@ -306,7 +306,18 @@ def get_consistency_loss_fn(
         if num_scales is None:
             num_scales = sde.N
 
-        indices = jax.random.randint(next(rng), (x.shape[0],), 0, num_scales - 1)
+        if index_distribution.lower() == "uniform":
+            indices = jax.random.randint(next(rng), (x.shape[0],), 0, num_scales - 1)
+        elif index_distribution.lower() == "improved":
+            mean = -1.1
+            std = 2 * jnp.sqrt(2)
+            logits = jax.scipy.special.erf(
+                (jnp.arange(1, num_scales) - mean) / std
+            ) - jax.scipy.special.erf((jnp.arange(0, num_scales - 1) - mean) / std)
+            indices = jax.random.categorical(next(rng), jnp.log(logits), (x.shape[0],))
+        else:
+            raise ValueError(f"Unknown index distribution {index_distribution}")
+
         t = sde.t_max ** (1 / sde.rho) + indices / (num_scales - 1) * (
             sde.t_min ** (1 / sde.rho) - sde.t_max ** (1 / sde.rho)
         )
@@ -342,6 +353,8 @@ def get_consistency_loss_fn(
             weight = jnp.maximum(1 / t**2, jnp.ones_like(t))
         elif weighting.lower() == "snr":
             weight = 1 / t**2
+        elif weighting.lower() == "improved":
+            weight = 1 / (t2 - t)
         else:
             raise NotImplementedError(f"Weighting {weighting} not implemented")
 
