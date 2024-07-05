@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""All functions related to loss computation and optimization.
-"""
+"""All functions related to loss computation and optimization."""
 
 import optax
 import jax
@@ -202,7 +201,6 @@ def get_loss_fn(config, sde, score_model, state, rng):
                 lpips_model=lpips_model,
                 lpips_params=lpips_params,
             )
-
         elif config.training.loss.lower() == "progressive_distillation":
             train_loss_fn = get_progressive_distillation_loss_fn(
                 sde,
@@ -364,6 +362,12 @@ def get_consistency_loss_fn(
                 Ft2, (Ft2.shape[0], 224, 224, 3), method="bilinear"
             )
             losses = jnp.squeeze(lpips_model.apply(lpips_params, scaled_Ft, scaled_Ft2))
+        elif loss_norm.lower() == "huber":
+            l2_losses = diffs**2
+            c = 0.00054 * jnp.sqrt(3 * 32 * 32)
+            losses = jnp.mean(
+                jnp.sqrt(l2_losses.reshape(l2_losses.shape[0], -1) + c**2) - c, axis=-1
+            )
 
         else:
             raise ValueError("Unknown loss norm: {}".format(loss_norm))
@@ -722,9 +726,7 @@ def get_score_matching_loss_fn(
             score, new_model_state = score_fn(perturbed_data, t, rng=next(rng))
 
             losses = jnp.square(batch_mul(score, std) + z)
-            losses = batch_mul(
-                losses, (std**2 + sde.data_std**2) / sde.data_std**2
-            )
+            losses = batch_mul(losses, (std**2 + sde.data_std**2) / sde.data_std**2)
             losses = jnp.sum(losses.reshape((losses.shape[0], -1)), axis=-1)
 
         else:
@@ -839,9 +841,7 @@ def get_score_matching_loss_fn(
             losses = (score_norm + score_trace) * std**2
         elif isinstance(sde, sde_lib.KVESDE):
             losses = score_norm + score_trace
-            losses = (
-                losses * std**2 * (std**2 + sde.data_std**2) / sde.data_std**2
-            )
+            losses = losses * std**2 * (std**2 + sde.data_std**2) / sde.data_std**2
         else:
             g2 = sde.sde(jnp.zeros_like(data), t)[1] ** 2
             losses = (score_norm + score_trace) * g2
@@ -915,8 +915,7 @@ def get_ema_scales_fn(config):
                 total_steps = int(config.training.n_iters)
                 scales = jnp.ceil(
                     jnp.sqrt(
-                        (step / total_steps)
-                        * ((end_scales + 1) ** 2 - start_scales**2)
+                        (step / total_steps) * ((end_scales + 1) ** 2 - start_scales**2)
                         + start_scales**2
                     )
                     - 1
@@ -946,6 +945,25 @@ def get_ema_scales_fn(config):
                 scales = jnp.where(scales == 2, sub_scales, scales)
 
                 target_ema = 1.0
+            elif (
+                config.training.target_ema_mode == "improved"
+                and config.training.scale_mode == "improved"
+            ):
+                start_scales = int(config.training.start_scales)
+                end_scales = int(config.training.end_scales)
+                total_steps = int(config.training.n_iters)
+                scaled_total_steps = jnp.floor(
+                    total_steps / (jnp.floor(jnp.log2(end_scales / start_scales)) + 1)
+                )
+                scales = (
+                    jnp.minimum(
+                        start_scales
+                        * (2 ** jnp.floor(start_scales / scaled_total_steps)),
+                        end_scales,
+                    )
+                    + 1
+                ).astype(jnp.int32)
+                target_ema = 0.0
             else:
                 raise NotImplementedError
 
@@ -999,9 +1017,12 @@ def get_step_fn(
             target_ema, num_scales = ema_scales_fn(step)
             if target_ema is None and num_scales is None:
                 (
-                    loss,
-                    (new_model_state, log_stats),
-                ), grad = grad_fn(step_rng, params, states, batch)
+                    (
+                        loss,
+                        (new_model_state, log_stats),
+                    ),
+                    grad,
+                ) = grad_fn(step_rng, params, states, batch)
 
                 grad = jax.lax.pmean(grad, axis_name="batch")
                 new_params, new_opt_state = optimize_fn(grad, opt_state, params)
