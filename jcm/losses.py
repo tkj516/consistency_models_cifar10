@@ -185,6 +185,7 @@ def get_loss_fn(config, sde, score_model, state, rng):
                 solver=config.training.solver,
                 lpips_model=lpips_model,
                 lpips_params=lpips_params,
+                index_distribution=config.training.index_distribution,
             )
             eval_loss_fn = get_consistency_loss_fn(
                 sde,
@@ -200,6 +201,7 @@ def get_loss_fn(config, sde, score_model, state, rng):
                 solver=config.training.solver,
                 lpips_model=lpips_model,
                 lpips_params=lpips_params,
+                index_distribution=config.training.index_distribution,
             )
         elif config.training.loss.lower() == "progressive_distillation":
             train_loss_fn = get_progressive_distillation_loss_fn(

@@ -16,6 +16,8 @@ def get_default_configs():
     training.snapshot_sampling = True
     training.likelihood_weighting = False
     training.n_jitted_steps = 5  # TODO: important flag!
+    ## added for improved consistency model
+    training.index_distribution = "uniform"
 
     # sampling
     config.sampling = sampling = ml_collections.ConfigDict()
