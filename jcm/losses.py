@@ -228,7 +228,29 @@ def get_loss_fn(config, sde, score_model, state, rng):
             state = state.replace(
                 target_params=ref_state.params_ema,
             )
-
+    elif config.training.loss.lower().startswith("autoencoder"):
+        if config.training.loss_norm.lower() == "lpips":
+            lpips_model, lpips_params = mutils.init_lpips(next(rng), config)
+        else:
+            lpips_model, lpips_params = None, None
+        train_loss_fn = get_autoencoder_loss_fn(
+            sde,
+            score_model,
+            train=True,
+            loss_norm=config.training.loss_norm,
+            weighting=config.training.weighting,
+            lpips_model=lpips_model,
+            lpips_params=lpips_params,
+        )
+        eval_loss_fn = get_autoencoder_loss_fn(
+            sde,
+            score_model,
+            train=False,
+            loss_norm=config.training.loss_norm,
+            weighting=config.training.weighting,
+            lpips_model=lpips_model,
+            lpips_params=lpips_params,
+        )
     else:
         raise ValueError(f"Unknown loss {config.training.loss}")
 
@@ -253,6 +275,7 @@ def get_consistency_loss_fn(
     solver="heun",
     lpips_model=None,
     lpips_params=None,
+    index_distribution="uniform",
 ):
     assert isinstance(sde, sde_lib.KVESDE), "Only KVE SDEs are supported for now."
     denoiser_fn = mutils.get_denoiser_fn(
@@ -1112,3 +1135,97 @@ def get_step_fn(
         return new_carry_state, (loss, mean_log_stats)
 
     return step_fn
+
+
+def get_autoencoder_loss_fn(
+    sde,
+    model,
+    train,
+    loss_norm="l1",
+    weighting="uniform",
+    lpips_model=None,
+    lpips_params=None,
+):
+    assert isinstance(sde, sde_lib.KVESDE), "Only KVE SDEs are supported for now."
+
+    def loss_fn(rng, params, states, batch, target_params=None, num_scales=None):
+        rng = hk.PRNGSequence(rng)
+        x = batch["image"]
+        if target_params is None:
+            target_params = params
+
+        if num_scales is None:
+            num_scales = sde.N
+
+        indices = jax.random.randint(next(rng), (x.shape[0],), 0, num_scales - 1)
+        t = sde.t_max ** (1 / sde.rho) + indices / (num_scales - 1) * (
+            sde.t_min ** (1 / sde.rho) - sde.t_max ** (1 / sde.rho)
+        )
+        t = t**sde.rho
+
+        t2 = sde.t_max ** (1 / sde.rho) + (indices + 1) / (num_scales - 1) * (
+            sde.t_min ** (1 / sde.rho) - sde.t_max ** (1 / sde.rho)
+        )
+        t2 = t2**sde.rho
+
+        z = jax.random.normal(next(rng), x.shape)
+        x_t = x + batch_mul(t, z)
+        x_t2 = x + batch_mul(t2, z)
+
+        dropout_rng = next(rng)
+        x_hat_t2, z, new_states = mutils.get_encoder_fn(
+            sde, model, params, states, train=train, return_state=True
+        )(x_t, t, t2, rng=dropout_rng if train else None)
+
+        target = batch_mul(x_t2, 1 / jnp.sqrt(t2**2 + sde.data_std**2))
+        diffs = target - x_hat_t2
+
+        if weighting.lower() == "uniform":
+            weight = jnp.ones_like(t)
+        elif weighting.lower() == "snrp1":
+            weight = 1 / t**2 + 1.0
+        elif weighting.lower() == "truncated_snr":
+            weight = jnp.maximum(1 / t**2, jnp.ones_like(t))
+        elif weighting.lower() == "snr":
+            weight = 1 / t**2
+        else:
+            raise NotImplementedError(f"Weighting {weighting} not implemented")
+
+        if loss_norm.lower() == "l1":
+            losses = jnp.abs(diffs)
+            losses = jnp.mean(losses.reshape(losses.shape[0], -1), axis=-1)
+        elif loss_norm.lower() == "l2":
+            losses = diffs**2
+            losses = jnp.mean(losses.reshape(losses.shape[0], -1), axis=-1)
+        elif loss_norm.lower() == "linf":
+            losses = jnp.abs(diffs)
+            losses = jnp.max(losses.reshape(losses.shape[0], -1), axis=-1)
+        elif loss_norm.lower() == "lpips":
+            scaled_x_t2 = jax.image.resize(
+                x_t2, (x_t2.shape[0], 224, 224, 3), method="bilinear"
+            )
+            scaled_x_hat_t2 = jax.image.resize(
+                batch_mul(jnp.sqrt(t2**2 + sde.data_std**2), x_hat_t2),
+                (x_hat_t2.shape[0], 224, 224, 3),
+                method="bilinear",
+            )
+            losses = jnp.squeeze(
+                lpips_model.apply(lpips_params, scaled_x_t2, scaled_x_hat_t2)
+            )
+
+        else:
+            raise ValueError("Unknown loss norm: {}".format(loss_norm))
+
+        loss = jnp.nansum(losses * batch["mask"] * weight / jnp.sum(batch["mask"]))
+        log_stats = {}
+
+        return loss, (new_states, log_stats)
+
+        ## Uncomment to log loss per time step
+        # for t_index in range(sde.N - 1):
+        #     mask = (indices == t_index).astype(jnp.float32)
+        #     log_stats["loss_t{}".format(t_index)] = jnp.nansum(
+        #         losses * batch["mask"] * mask / jnp.sum(batch["mask"] * mask)
+        #     )
+
+    return loss_fn

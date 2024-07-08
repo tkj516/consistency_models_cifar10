@@ -21,6 +21,8 @@ import haiku as hk
 import functools
 import jax.numpy as jnp
 
+from jcm.models.autoencoder import Autoencoder
+
 from .. import sde_lib
 import jax
 import numpy as np
@@ -439,3 +441,28 @@ def get_classifier_grad_fn(logit_fn):
         return jax.grad(prob_fn)(data)
 
     return grad_fn
+
+
+def get_autoencoder_fn(
+    sde, model, params, states, train=False, return_state=False, pred_t=None
+):
+    assert isinstance(
+        sde, sde_lib.KVESDE
+    ), "Only KVE SDE is supported for building the denoiser"
+    model_fn = get_model_fn(model, params, states, train=train)
+
+    if pred_t is None:
+        pred_t = sde.t_min
+
+    def autoencoder_fn(x, t, t2, rng=None):
+        in_x = batch_mul(x, 1 / jnp.sqrt(t**2 + sde.data_std**2))
+        cond_t = 0.25 * jnp.log(t)
+        cond_t2 = 0.25 * jnp.log(t2)
+        denoiser, state = model_fn(in_x, cond_t, cond_t2, rng)
+
+        if return_state:
+            return denoiser, state
+        else:
+            return denoiser
+
+    return autoencoder_fn
